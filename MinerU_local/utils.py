@@ -1,0 +1,259 @@
+import hashlib
+import os
+import shutil
+import time
+import uuid
+import zipfile
+
+import fitz
+import requests
+
+CROSSREF_HEADERS = {"mailto": "rosalinagibboneyreg98@gmail.com"}
+
+
+def pdf_to_unique_uuid(pdf_path, namespace=uuid.NAMESPACE_OID):
+    """Generate a unique and stable UUID identifier for a PDF (same PDF returns the same UUID).
+
+    :param pdf_path: Path to the PDF file (local file)
+    :param namespace: UUID namespace (fixed value to ensure consistent conversion rules)
+    :return: Standard UUID string (e.g., "b56254e7-88ab-4301-a7ae-dada0ac8e063")
+    """
+
+    # 第一步：计算PDF文件的内容哈希（SHA-256）
+    def calculate_file_hash(file_path, chunk_size=1024 * 1024):
+        """Load file by chunks & Calculate SHA-256 hash (avoid large memory usage for large files)."""
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while chunk := f.read(chunk_size):
+                sha256.update(chunk)
+        return sha256.hexdigest()  # 返回64位十六进制哈希字符串
+
+    # 检查文件是否存在
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF文件不存在：{pdf_path}")
+
+    # 计算PDF内容哈希（核心：内容相同则哈希相同）
+    file_hash = calculate_file_hash(pdf_path)
+
+    # 第二步：将哈希值转换为UUID（UUIDv5，基于命名空间+哈希值）
+    # UUIDv5要求"名称"是字节串，因此先将哈希字符串编码为UTF-8
+    unique_uuid = uuid.uuid5(namespace, file_hash)  # 去掉 .encode("utf-8")
+
+    # 转换为标准UUID字符串（带分隔符）
+    return str(unique_uuid)
+
+
+def extract_title_from_metadata(pdf_path):
+    """Extract the title and metadata from a PDF file.
+
+    Args:
+        pdf_path (str): The path to the PDF file.
+
+    Returns:
+        tuple: A tuple containing the title (str) and metadata (dict) of the PDF.
+    """
+    doc = fitz.open(pdf_path)
+    metadata = doc.metadata  # 'format', 'title', 'author', 'subject', 'keywords', 'creator', 'producer', 'creationDate', 'modDate', 'trapped', 'encryption'
+    title = metadata.get("title", "").strip()
+    doc.close()
+    return title, metadata
+
+
+def get_references_from_crossref(doi):
+    """Retrieve references for a given DOI from the CrossRef API.
+
+    Args:
+        doi (str): The DOI of the resource to fetch references for.
+
+    Returns:
+        list or str: A list of references if found, otherwise a message indicating no references or an error.
+
+    Raises:
+        requests.exceptions.HTTPError: If an HTTP error occurs during the API request.
+        Exception: For other exceptions during the API request.
+    """
+    url = f"https://api.crossref.org/works/{doi}"
+    headers = {"Accept": "application/json"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        data = response.json()["message"]
+
+        references = data.get("reference", [])
+        if not references:
+            return f"No references found for scholar [{doi}] [Not Provided]"
+
+        ref_list = []
+        for idx, ref in enumerate(references):
+            ref_info = {
+                "index": idx,
+                "reference DOI": ref.get("DOI", ""),
+                "title": ref.get("title", [""])[0],
+                "author": ref.get("author", ""),
+                "container": ref.get("container-title", [""])[0],
+                "Year": ref.get("issued", {}).get("date-parts", [[]])[0][0] or None,
+            }
+            ref_list.append(ref_info)
+        return ref_list
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 404:
+            return f"DOI not exist or not included by CrossRef: {doi}"
+        return f"HTTP Error: {e}"
+    except Exception as e:
+        return f"Search failed: {e}"
+
+
+def safe_extract_zip(zip_path: str, extract_dir: str) -> None:
+    """Safely extract a zip file to prevent Zip Slip vulnerability.
+
+    Extracts the contents of a zip file to the specified directory. If the directory
+    already exists, files with the same name will be overwritten (default behavior).
+
+    Args:
+        zip_path (str): The path to the zip file to be extracted.
+        extract_dir (str): The directory where the contents of the zip file will be extracted.
+
+    Returns:
+        Tuple[str, str]: The path to the zip file and the extraction directory.
+    """
+    os.makedirs(extract_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        for member in z.namelist():
+            member_path = os.path.normpath(member)
+            # 忽略绝对路径或包含上级目录引用的成员
+            if member_path.startswith("..") or os.path.isabs(member_path):
+                continue
+            dest_path = os.path.abspath(os.path.join(extract_dir, member_path))
+            if not dest_path.startswith(os.path.abspath(extract_dir) + os.sep) and os.path.abspath(
+                dest_path
+            ) != os.path.abspath(extract_dir):
+                continue
+            # 如果是目录，确保存在，否则写文件
+            if member.endswith("/"):
+                os.makedirs(dest_path, exist_ok=True)
+            else:
+                parent = os.path.dirname(dest_path)
+                os.makedirs(parent, exist_ok=True)
+                with z.open(member) as source, open(dest_path, "wb") as target:
+                    shutil.copyfileobj(source, target)
+    return zip_path, extract_dir
+
+
+def extract_zip_to_named_folder(zip_path: str, output_parent: str = None, logger=None) -> str:
+    """Extract the contents of a ZIP file to a named folder within the specified parent directory.
+
+    Args:
+        zip_path (str): The path to the ZIP file to be extracted.
+        output_parent (str, optional): The parent directory where the extracted folder will be created.
+            Defaults to the directory containing `zip_path`.
+        logger (optional): A logger instance for logging warnings. If not provided, warnings are printed to the console.
+
+    Returns:
+        str: The path to the directory where the ZIP file was extracted.
+    """
+    output_parent = output_parent if output_parent is not None else os.path.dirname(output_parent)
+    base = os.path.basename(zip_path)
+    name, ext = os.path.splitext(base)
+    if not ext.lower() == ".zip":
+        if logger is not None:
+            logger.warning("文件似乎不是 .zip: %s (Still trying to extract)", zip_path)
+        else:
+            print("文件似乎不是 .zip: %s (Still trying to extract)", zip_path)
+    dest = os.path.join(output_parent, name)
+    safe_extract_zip(zip_path, dest)
+    return dest
+
+
+def doi2dict(doi: str, max_try=1):
+    """Fetch metadata for a given DOI from the CrossRef API.
+
+    Args:
+        doi (str): The DOI of the resource to fetch metadata for.
+        max_try (int): The maximum number of retry attempts in case of failure.
+
+    Returns:
+        dict or None: The metadata dictionary if the request is successful, otherwise None.
+    """
+    url = f"https://api.crossref.org/works/{doi}"
+
+    for try_idx in range(max_try):
+        try:
+            response = requests.get(url, CROSSREF_HEADERS)
+            response.raise_for_status()
+            # assert response.status_code == 200
+            data = response.json()
+            return data["message"]
+        except requests.exceptions.RequestException:
+            # print(f"[===ERROR===]\n{url}\n{e}\n[===ERROR===]")
+            if try_idx < (max_try - 1):
+                time.sleep(0.2)
+
+    return None
+
+
+def doi2html(doi: str, max_try=3):
+    """Fetch the HTML content of a DOI URL.
+
+    Args:
+        doi (str): The DOI of the resource to fetch.
+        max_try (int): The maximum number of retry attempts in case of failure.
+
+    Returns:
+        str or None: The HTML content of the DOI URL if successful, otherwise None.
+    """
+    url = f"https://doi.org/{doi}"
+
+    for try_idx in range(max_try):
+        try:
+            response = requests.get(url)
+            response.raise_for_status()  # 检查请求是否成功
+            return response.text
+        except requests.exceptions.RequestException:
+            if try_idx < (max_try - 1):
+                time.sleep(0.2)
+
+    return None
+
+
+def doi2journal(doi: str, max_try=1):
+    """Retrieve the journal name associated with a given DOI.
+
+    Args:
+        doi (str): The DOI of the resource.
+        max_try (int): The maximum number of retry attempts in case of failure.
+
+    Returns:
+        str: The name of the journal if found, otherwise "None".
+    """
+    data = doi2dict(doi, max_try)
+    if isinstance(data, dict) and isinstance(data["container-title"], list) and len(data["container-title"]) > 0:
+        journal_name = data["container-title"][0]
+        return journal_name
+    return "None"
+
+
+def doi2cite(doi: str, max_try=1):
+    """Retrieve the citation count for a given DOI.
+
+    Args:
+        doi (str): The DOI of the resource.
+        max_try (int): The maximum number of retry attempts in case of failure.
+
+    Returns:
+        int or None: The citation count if successful, otherwise None.
+    """
+    url = f"https://api.crossref.org/works/{doi}/transform/application/vnd.citationstyles.csl+json"
+
+    for try_idx in range(max_try):
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            data = response.json()
+            return int(data["is-referenced-by-count"])
+        except requests.exceptions.RequestException:
+            # print(f"[===ERROR===]\n{url}\n{e}\n[===ERROR===]")
+            if try_idx < (max_try - 1):
+                time.sleep(0.2)
+
+    return None
